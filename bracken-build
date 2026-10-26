@@ -21,7 +21,7 @@
 #
 #####################################################################
 
-set -eu
+set -euo pipefail
 THREADS=1
 KMER_LEN=35
 READ_LEN=100
@@ -171,28 +171,72 @@ then
     ln -s $DATABASE/database.kraken.tsv $DATABASE/database.kraken
 
 else
-    filenames=`find -L $DATABASE/library \( -name "*.fna" -o -name "*.fa" -o -name "*.fasta" \) -print`
-    if [ $KRAKEN == "kraken2" ]
+    #database.kraken not found, must create
+    #
+    # The library FASTA files are never expanded onto the command line: a
+    # library with many files (e.g. one per genome from --add-to-library)
+    # exceeds the OS argument-size limit (ARG_MAX) and the exec fails with
+    # "Argument list too long".
+    LIB_FIND=(find -L "$DATABASE/library" -type f \( -name "*.fna" -o -name "*.fa" -o -name "*.fasta" \))
+    KRAKEN_TMP="$DATABASE/database.kraken.tmp"
+    NUM_FILES=$("${LIB_FIND[@]}" -print | wc -l | tr -d ' ')
+    if [ "$NUM_FILES" -eq 0 ]
     then
-        #database.kraken not found, must create
-        echo "      >> ${KINSTALL}kraken2 --db $DATABASE --threads ${THREADS} $filenames > $DATABASE/database.kraken.tmp"
-        ${KINSTALL}kraken2 --db $DATABASE --threads ${THREADS} $filenames > $DATABASE/database.kraken.tmp
-    elif [ $KRAKEN == "krakenuniq" ]
+        echo " ERROR: No library FASTA files (*.fna, *.fa, *.fasta) found under $DATABASE/library"
+        exit 1
+    fi
+    echo "          Found $NUM_FILES library FASTA file(s)"
+
+    if [ "$KRAKEN" == "krakenuniq" ]
     then
-        #database.kraken not found, must create
-        echo "      >> ${KINSTALL}krakenuniq --db $DATABASE --threads ${THREADS} $filenames > $DATABASE/database.kraken.tmp"
-        ${KINSTALL}krakenuniq --db $DATABASE --threads ${THREADS} $filenames > $DATABASE/database.kraken.tmp
+        # KrakenUniq reads the start of its input file to detect FASTA/FASTQ
+        # and then reopens it, so it cannot read from a pipe without losing
+        # data. Pass the files in batches that fit the argument limit instead;
+        # the database is reloaded once per batch.
+        echo "      >> ${LIB_FIND[*]} -print0 | xargs -0 ${KINSTALL}krakenuniq --db $DATABASE --threads ${THREADS} > $KRAKEN_TMP"
+        # Exit status 255 makes xargs stop at the first failed batch.
+        build_cmd() {
+            "${LIB_FIND[@]}" -print0 \
+                | xargs -0 sh -c 'k=$1 db=$2 t=$3; shift 3
+                                  "$k" --db "$db" --threads "$t" "$@" || exit 255' \
+                    sh "${KINSTALL}krakenuniq" "$DATABASE" "${THREADS}"
+        }
     else
-        #database.kraken not found, must create
-        echo "      >> ${KINSTALL}kraken --db $DATABASE --threads ${THREADS} $filenames > $DATABASE/database.kraken.tmp"
-        ${KINSTALL}kraken --db $DATABASE --threads ${THREADS} $filenames > $DATABASE/database.kraken.tmp
-    fi 
-    if [ $? -eq 0 ]
+        # Kraken 2 and Kraken 1 open their input once, so stream every library
+        # file into a single run on stdin and the database is loaded once.
+        # CAT_FASTA works like `cat`, but adds a newline after any file that
+        # does not end with one, so the last line of one file cannot merge
+        # with the next file's header. It is Perl (already required by Kraken)
+        # because a per-file shell check costs several forks per file.
+        CAT_FASTA='
+            for my $f (@ARGV) {
+                open(my $fh, "<", $f) or die "bracken-build: cannot read $f: $!\n";
+                binmode $fh;
+                my ($buf, $n, $last) = ("", 0, "");
+                while ($n = sysread($fh, $buf, 1 << 20)) {
+                    print $buf;
+                    $last = substr($buf, -1);
+                }
+                defined $n or die "bracken-build: error reading $f: $!\n";
+                close $fh;
+                print "\n" if $last ne "" && $last ne "\n";
+            }
+            close(STDOUT) or die "bracken-build: write error: $!\n";'
+        echo "      >> ${LIB_FIND[*]} -exec perl -e \"\$CAT_FASTA\" {} + | ${KINSTALL}${KRAKEN} --db $DATABASE --threads ${THREADS} /dev/stdin > $KRAKEN_TMP"
+        build_cmd() {
+            "${LIB_FIND[@]}" -exec perl -e "$CAT_FASTA" {} + \
+                | "${KINSTALL}${KRAKEN}" --db "$DATABASE" --threads "${THREADS}" /dev/stdin
+        }
+    fi
+
+    # Run as an `if` condition so a failure reaches the cleanup below rather
+    # than `set -e` exiting and leaving a partial database.kraken.tmp behind.
+    if build_cmd > "$KRAKEN_TMP"
     then
-        mv $DATABASE/database.kraken.tmp $DATABASE/database.kraken
+        mv "$KRAKEN_TMP" "$DATABASE/database.kraken"
         echo "          Finished creating database.kraken [in DB folder]"
     else
-        rm $DATABASE/database.kraken.tmp
+        rm -f "$KRAKEN_TMP"
         echo "          Unable to create database.kraken [in DB folder]"
         exit 1
     fi
