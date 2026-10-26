@@ -76,10 +76,13 @@ echo "       read length = $READ_LEN"
 echo "       database    = $DATABASE"
 echo "       threads     = $THREADS"
 echo "       kraken type = $KTYPE"
-if [[ "$DATABASE" =~ "/"$ ]]
-then
-    DATABASE=${DATABASE:0:-1}
-fi
+# Strip trailing slashes (e.g. "mydb/" or "mydb//"). ${DATABASE%/} rather than
+# ${DATABASE:0:-1}: negative substring lengths need bash >= 4.2, and macOS
+# ships bash 3.2 as /bin/bash.
+while [ "${#DATABASE}" -gt 1 ] && [ "${DATABASE%/}" != "$DATABASE" ]
+do
+    DATABASE=${DATABASE%/}
+done
 #Check for Kraken version
 if [ "$KINSTALL" == "" ]; then
     if [ "$KTYPE" == "kraken2" ]; then
